@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
 
 class Message extends Model
 {
@@ -17,7 +18,8 @@ class Message extends Model
         'role',
         'content',
         'included_in_summary',
-        'blood_exam_id',
+        'examable_id',
+        'examable_type',
     ];
 
     protected $casts = [
@@ -30,8 +32,8 @@ class Message extends Model
         return $this->belongsTo(Conversation::class);
     }
 
-    public function bloodExam(): BelongsTo
+    public function examable(): MorphTo
     {
-        return $this->belongsTo(BloodExam::class);
+        return $this->morphTo();
     }
 }

@@ -5,7 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\MorphMany;
 
 class BloodExam extends Model
 {
@@ -85,8 +85,8 @@ class BloodExam extends Model
         return $this->belongsTo(Patient::class);
     }
 
-    public function messages(): HasMany
+    public function messages(): MorphMany
     {
-        return $this->hasMany(Message::class);
+        return $this->morphMany(Message::class, 'examable');
     }
 }

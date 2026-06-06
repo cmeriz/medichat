@@ -14,7 +14,7 @@ return new class extends Migration
             $table->string('role', 10);
             $table->text('content');
             $table->boolean('included_in_summary')->default(false);
-            $table->foreignId('blood_exam_id')->nullable()->constrained()->nullOnDelete();
+            $table->nullableMorphs('examable');
             $table->timestamp('created_at')->useCurrent();
         });
     }

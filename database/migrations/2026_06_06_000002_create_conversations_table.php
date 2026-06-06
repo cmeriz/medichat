@@ -16,6 +16,8 @@ return new class extends Migration
             $table->unsignedBigInteger('summary_from_message_id')->nullable();
             $table->timestamp('started_at')->useCurrent();
             $table->timestamp('updated_at')->nullable();
+
+            $table->index('summary_from_message_id');
         });
     }
 

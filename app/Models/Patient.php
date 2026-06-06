@@ -12,6 +12,7 @@ class Patient extends Model
 
     protected $fillable = [
         'identification_number',
+        'name',
     ];
 
     public function conversations(): HasMany
@@ -22,5 +23,15 @@ class Patient extends Model
     public function bloodExams(): HasMany
     {
         return $this->hasMany(BloodExam::class);
+    }
+
+    public function urineExams(): HasMany
+    {
+        return $this->hasMany(UrineExam::class);
+    }
+
+    public function aiRequests(): HasMany
+    {
+        return $this->hasMany(AiRequest::class);
     }
 }
