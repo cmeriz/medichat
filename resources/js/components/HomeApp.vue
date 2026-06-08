@@ -2,8 +2,10 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { ElMessage } from 'element-plus';
 
+const maxPdfSizeMb = 50;
 const messages = ref([]);
 const draft = ref('');
+const fileList = ref([]);
 const isSending = ref(false);
 const sessionId = ref(null);
 const messagesEnd = ref(null);
@@ -36,29 +38,81 @@ onBeforeUnmount(() => {
 
 async function sendMessage() {
     const content = draft.value.trim();
+    const examFile = fileList.value[0]?.raw ?? null;
 
-    if (!content || isSending.value) {
+    if ((!content && !examFile) || isSending.value) {
         return;
     }
 
     messages.value.push({
         id: messageId(),
         role: 'user',
-        content,
+        content: userBubbleContent(content, examFile),
         created_at: new Date().toISOString(),
     });
 
     draft.value = '';
+    fileList.value = [];
     isSending.value = true;
     scrollToBottom();
 
     try {
-        await window.axios.post('/chat/message', { content });
+        const payload = new FormData();
+
+        if (content) {
+            payload.append('content', content);
+        }
+
+        if (examFile) {
+            payload.append('exam_file', examFile);
+        }
+
+        await window.axios.post('/chat/message', payload, {
+            headers: {
+                'Content-Type': 'multipart/form-data',
+            },
+        });
     } catch (error) {
         ElMessage.error('Your message could not be sent.');
     } finally {
         isSending.value = false;
     }
+}
+
+function beforePdfUpload(file) {
+    if (file.type !== 'application/pdf') {
+        ElMessage.error('Only PDF files are supported for now.');
+
+        return false;
+    }
+
+    if (file.size / 1024 / 1024 > maxPdfSizeMb) {
+        ElMessage.error(`PDF files must be ${maxPdfSizeMb}MB or smaller.`);
+
+        return false;
+    }
+
+    return true;
+}
+
+function onPdfChange(file, files) {
+    if (!beforePdfUpload(file.raw)) {
+        fileList.value = [];
+
+        return;
+    }
+
+    fileList.value = files.slice(-1);
+}
+
+function onPdfRemove() {
+    fileList.value = [];
+}
+
+function userBubbleContent(content, examFile) {
+    const filename = examFile ? `[Attached PDF: ${examFile.name}]` : '';
+
+    return [content, filename].filter(Boolean).join('\n\n');
 }
 
 function scrollToBottom() {
@@ -178,11 +232,33 @@ function escapeHtml(text) {
                 </div>
 
                 <form class="border-t border-slate-200 p-4" @submit.prevent="sendMessage">
+                    <div class="mb-3">
+                        <el-upload
+                            v-model:file-list="fileList"
+                            accept="application/pdf,.pdf"
+                            :auto-upload="false"
+                            :limit="1"
+                            :before-upload="beforePdfUpload"
+                            :on-change="onPdfChange"
+                            :on-remove="onPdfRemove"
+                            :disabled="isSending"
+                        >
+                            <el-button :disabled="isSending">
+                                Attach PDF
+                            </el-button>
+                            <template #tip>
+                                <div class="mt-1 text-xs text-slate-500">
+                                    PDF only, maximum 50MB.
+                                </div>
+                            </template>
+                        </el-upload>
+                    </div>
+
                     <div class="flex gap-3">
                         <el-input
                             v-model="draft"
                             size="large"
-                            placeholder="Type your message"
+                            placeholder="Type your message, or attach a PDF"
                             :disabled="isSending"
                             @keyup.enter="sendMessage"
                         />

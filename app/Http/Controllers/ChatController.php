@@ -7,9 +7,12 @@ use App\Models\AiRequest;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Patient;
+use App\Models\UrineExam;
 use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
 
 class ChatController extends Controller
@@ -37,11 +40,12 @@ class ChatController extends Controller
     public function message(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'content' => ['required', 'string', 'max:2000'],
+            'content' => ['nullable', 'string', 'max:2000', 'required_without:exam_file'],
+            'exam_file' => ['nullable', 'file', 'mimes:pdf', 'max:51200'],
         ]);
 
-        $content = trim($validated['content']);
-        $reply = $this->handleIncomingMessage($request, $content);
+        $content = trim($validated['content'] ?? '');
+        $reply = $this->handleIncomingMessage($request, $content, $request->file('exam_file'));
 
         broadcast(new ChatMessageSent(
             $request->session()->getId(),
@@ -53,10 +57,14 @@ class ChatController extends Controller
         ]);
     }
 
-    private function handleIncomingMessage(Request $request, string $content): string
+    private function handleIncomingMessage(Request $request, string $content, ?UploadedFile $examFile): string
     {
         if ($request->session()->get('patient_id')) {
-            return $this->answerWithAi($request, $content);
+            return $this->answerWithAi($request, $content, $examFile);
+        }
+
+        if ($examFile) {
+            return 'Please enter your identification number before attaching an exam PDF.';
         }
 
         if ($request->session()->has('pending_identification_number')) {
@@ -94,7 +102,7 @@ class ChatController extends Controller
         return "Welcome back, {$this->patientName($patient)}. What can I do for you today?";
     }
 
-    private function answerWithAi(Request $request, string $content): string
+    private function answerWithAi(Request $request, string $content, ?UploadedFile $examFile): string
     {
         $conversation = Conversation::query()
             ->whereKey($request->session()->get('conversation_id'))
@@ -103,11 +111,15 @@ class ChatController extends Controller
         $currentUserMessage = Message::create([
             'conversation_id' => $conversation->id,
             'role' => 'user',
-            'content' => $content,
+            'content' => $this->userMessageContent($content, $examFile),
         ]);
 
         try {
-            $reply = $this->createChatCompletion($conversation, $currentUserMessage);
+            if ($examFile) {
+                $reply = $this->analyzeExamPdf($conversation, $currentUserMessage, $content, $examFile);
+            } else {
+                $reply = $this->createChatCompletion($conversation, $currentUserMessage);
+            }
         } catch (Exception $exception) {
             report($exception);
 
@@ -127,6 +139,57 @@ class ChatController extends Controller
         }
 
         return $reply;
+    }
+
+    private function analyzeExamPdf(
+        Conversation $conversation,
+        Message $currentUserMessage,
+        string $content,
+        UploadedFile $examFile,
+    ): string {
+        $model = config('services.openai.model', 'gpt-4o-mini');
+        $messages = $this->messagesForExamExtraction($conversation, $content, $examFile);
+
+        try {
+            $response = $this->openAiClient()->chat()->create([
+                'model' => $model,
+                'temperature' => 0.1,
+                'response_format' => ['type' => 'json_object'],
+                'messages' => $messages,
+            ]);
+        } catch (Exception $exception) {
+            $this->recordAiRequest($conversation, 'exam_pdf', $model, $messages, null, $exception);
+
+            throw $exception;
+        }
+
+        $this->recordAiRequest($conversation, 'exam_pdf', $model, $messages, $response);
+
+        $payload = json_decode($response->choices[0]->message->content ?? '{}', true);
+
+        if (! is_array($payload)) {
+            return 'I could not read that PDF clearly. Please try another PDF version of the exam.';
+        }
+
+        if (! in_array($payload['document_type'] ?? null, ['blood_exam', 'urine_exam'], true)) {
+            return $payload['user_response'] ?? 'This document is not supported yet. For now I can only analyze blood exam and urine exam PDFs.';
+        }
+
+        if (blank($payload['exam_date'] ?? null)) {
+            return 'I can analyze this exam, but I could not find the exam date. Please send the PDF again and include the exam date in your message.';
+        }
+
+        if (! $this->isValidExamDate($payload['exam_date'])) {
+            return 'I found a possible exam date, but it was not clear enough to save. Please send the PDF again and include the exam date in YYYY-MM-DD format.';
+        }
+
+        $exam = $this->storeExamFromExtraction($conversation, $payload);
+        $currentUserMessage->update([
+            'examable_type' => $exam::class,
+            'examable_id' => $exam->id,
+        ]);
+
+        return $payload['user_response'] ?? 'I extracted and saved this exam. Please consult a qualified clinician before making medical decisions from these results.';
     }
 
     private function createChatCompletion(Conversation $conversation, Message $currentUserMessage): string
@@ -172,6 +235,265 @@ class ChatController extends Controller
         return trim($response->choices[0]->message->content ?? $conversation->context_summary ?? '');
     }
 
+    private function messagesForExamExtraction(Conversation $conversation, string $content, UploadedFile $examFile): array
+    {
+        $conversation->load('patient');
+        $userText = $content ?: 'Please analyze this exam PDF.';
+
+        return [
+            [
+                'role' => 'system',
+                'content' => $this->examExtractionPrompt($conversation),
+            ],
+            [
+                'role' => 'user',
+                'content' => [
+                    [
+                        'type' => 'text',
+                        'text' => $userText,
+                    ],
+                    [
+                        'type' => 'file',
+                        'file' => [
+                            'filename' => $examFile->getClientOriginalName(),
+                            'file_data' => 'data:application/pdf;base64,'.base64_encode(file_get_contents($examFile->getRealPath())),
+                        ],
+                    ],
+                ],
+            ],
+        ];
+    }
+
+    private function examExtractionPrompt(Conversation $conversation): string
+    {
+        $patientName = $this->patientName($conversation->patient);
+
+        return <<<PROMPT
+You are MediChat, a medical exam extraction assistant.
+
+Patient name: {$patientName}
+
+Analyze the attached PDF. For this demo, assume the exam belongs to the current patient even if the PDF names another person.
+
+Supported document types:
+- blood_exam
+- urine_exam
+
+If the PDF is not a blood exam or urine exam, return document_type "unsupported" and do not extract values.
+
+Rules:
+- Return only valid JSON. No Markdown outside JSON.
+- exam_date is required. Use YYYY-MM-DD.
+- If no exam date appears in the PDF or user message, set exam_date to null.
+- Use null for any value that is not present.
+- Normalize blood count units for storage: rbc as millions/uL, wbc and absolute differentials as thousands/uL, and platelets as thousands/uL.
+- Example: RBC 5,290,000 becomes 5.29, WBC 7,210 becomes 7.21, platelets 274,000 becomes 274.
+- Put any raw extraction notes or unrecognized values in ai_extraction_raw.
+- user_response must be Markdown for the patient.
+- Do not diagnose. Explain notable findings cautiously and recommend clinician review.
+
+JSON shape:
+{
+  "document_type": "blood_exam|urine_exam|unsupported",
+  "exam_date": "YYYY-MM-DD|null",
+  "lab_name": "string|null",
+  "blood_exam": {
+    "rbc": null, "hemoglobin": null, "hematocrit": null, "mcv": null, "mch": null, "mchc": null, "rdw": null,
+    "wbc": null, "neutrophils_pct": null, "neutrophils_abs": null, "lymphocytes_pct": null, "lymphocytes_abs": null,
+    "monocytes_pct": null, "monocytes_abs": null, "eosinophils_pct": null, "eosinophils_abs": null,
+    "basophils_pct": null, "basophils_abs": null, "platelets": null, "mpv": null,
+    "glucose": null, "bun": null, "creatinine": null, "egfr": null, "sodium": null, "potassium": null,
+    "chloride": null, "co2": null, "calcium": null, "total_cholesterol": null, "hdl_cholesterol": null,
+    "ldl_cholesterol": null, "vldl_cholesterol": null, "triglycerides": null, "total_bilirubin": null,
+    "direct_bilirubin": null, "indirect_bilirubin": null, "ast": null, "alt": null, "alp": null, "ggt": null,
+    "total_protein": null, "albumin": null, "tsh": null, "free_t4": null, "free_t3": null,
+    "serum_iron": null, "tibc": null, "transferrin_saturation": null, "ferritin": null,
+    "crp": null, "esr": null, "hba1c": null, "fasting_insulin": null
+  },
+  "urine_exam": {
+    "color": null, "appearance": null, "specific_gravity": null, "ph": null, "protein": null, "glucose": null,
+    "ketones": null, "bilirubin": null, "urobilinogen": null, "blood": null, "nitrite": null,
+    "leukocyte_esterase": null, "wbc": null, "rbc": null, "epithelial_cells": null, "bacteria": null,
+    "casts": null, "crystals": null, "mucus": null, "yeast": null
+  },
+  "ai_extraction_raw": {},
+  "notes": "string|null",
+  "user_response": "Markdown response"
+}
+PROMPT;
+    }
+
+    private function storeExamFromExtraction(Conversation $conversation, array $payload)
+    {
+        $common = [
+            'patient_id' => $conversation->patient_id,
+            'exam_date' => $payload['exam_date'],
+            'lab_name' => $payload['lab_name'] ?? null,
+            'file_path' => null,
+            'file_original_name' => null,
+            'ai_extraction_raw' => $payload['ai_extraction_raw'] ?? $payload,
+            'notes' => $payload['notes'] ?? null,
+        ];
+
+        if (($payload['document_type'] ?? null) === 'urine_exam') {
+            $urineValues = $this->onlyAllowed($payload['urine_exam'] ?? [], [
+                'color',
+                'appearance',
+                'protein',
+                'glucose',
+                'ketones',
+                'bilirubin',
+                'urobilinogen',
+                'blood',
+                'nitrite',
+                'leukocyte_esterase',
+                'wbc',
+                'rbc',
+                'epithelial_cells',
+                'bacteria',
+                'casts',
+                'crystals',
+                'mucus',
+                'yeast',
+            ]);
+
+            $urineValues['specific_gravity'] = $this->decimalOrNull(data_get($payload, 'urine_exam.specific_gravity'));
+            $urineValues['ph'] = $this->decimalOrNull(data_get($payload, 'urine_exam.ph'));
+
+            return UrineExam::create(array_merge($common, $urineValues));
+        }
+
+        return \App\Models\BloodExam::create(array_merge($common, $this->bloodExamValues($payload['blood_exam'] ?? [], [
+            'rbc',
+            'hemoglobin',
+            'hematocrit',
+            'mcv',
+            'mch',
+            'mchc',
+            'rdw',
+            'wbc',
+            'neutrophils_pct',
+            'neutrophils_abs',
+            'lymphocytes_pct',
+            'lymphocytes_abs',
+            'monocytes_pct',
+            'monocytes_abs',
+            'eosinophils_pct',
+            'eosinophils_abs',
+            'basophils_pct',
+            'basophils_abs',
+            'platelets',
+            'mpv',
+            'glucose',
+            'bun',
+            'creatinine',
+            'egfr',
+            'sodium',
+            'potassium',
+            'chloride',
+            'co2',
+            'calcium',
+            'total_cholesterol',
+            'hdl_cholesterol',
+            'ldl_cholesterol',
+            'vldl_cholesterol',
+            'triglycerides',
+            'total_bilirubin',
+            'direct_bilirubin',
+            'indirect_bilirubin',
+            'ast',
+            'alt',
+            'alp',
+            'ggt',
+            'total_protein',
+            'albumin',
+            'tsh',
+            'free_t4',
+            'free_t3',
+            'serum_iron',
+            'tibc',
+            'transferrin_saturation',
+            'ferritin',
+            'crp',
+            'esr',
+            'hba1c',
+            'fasting_insulin',
+        ])));
+    }
+
+    private function onlyAllowed(array $values, array $allowed): array
+    {
+        return collect($values)
+            ->only($allowed)
+            ->map(fn ($value) => $value === '' ? null : $value)
+            ->all();
+    }
+
+    private function decimalValues(array $values, array $allowed): array
+    {
+        return collect($allowed)
+            ->mapWithKeys(fn (string $key): array => [$key => $this->decimalOrNull($values[$key] ?? null)])
+            ->all();
+    }
+
+    private function bloodExamValues(array $values, array $allowed): array
+    {
+        $normalized = $this->decimalValues($values, $allowed);
+
+        if (($normalized['rbc'] ?? null) > 1000) {
+            $normalized['rbc'] = round($normalized['rbc'] / 1_000_000, 2);
+        }
+
+        foreach (['wbc', 'neutrophils_abs', 'lymphocytes_abs', 'monocytes_abs', 'eosinophils_abs', 'basophils_abs'] as $key) {
+            if (($normalized[$key] ?? null) > 100) {
+                $normalized[$key] = round($normalized[$key] / 1000, 2);
+            }
+        }
+
+        if (($normalized['platelets'] ?? null) > 1000) {
+            $normalized['platelets'] = round($normalized['platelets'] / 1000, 2);
+        }
+
+        return $normalized;
+    }
+
+    private function decimalOrNull(mixed $value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        if (is_string($value) && preg_match('/-?\d+(?:\.\d+)?/', $value, $matches)) {
+            return (float) $matches[0];
+        }
+
+        return null;
+    }
+
+    private function isValidExamDate(string $date): bool
+    {
+        try {
+            return Carbon::createFromFormat('Y-m-d', $date)->format('Y-m-d') === $date;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    private function userMessageContent(string $content, ?UploadedFile $examFile): string
+    {
+        if (! $examFile) {
+            return $content;
+        }
+
+        $attachmentLine = '[Attached PDF: '.$examFile->getClientOriginalName().']';
+
+        return trim($content) !== '' ? trim($content)."\n\n".$attachmentLine : $attachmentLine;
+    }
+
     private function recordAiRequest(
         Conversation $conversation,
         string $requestType,
@@ -192,7 +514,7 @@ class ChatController extends Controller
             'model' => $model,
             'endpoint' => 'chat.completions',
             'request_type' => $requestType,
-            'prompt_messages' => $messages,
+            'prompt_messages' => $this->messagesForAudit($messages),
             'response_text' => data_get($response, 'choices.0.message.content'),
             'response_id' => data_get($response, 'id'),
             'finish_reason' => data_get($response, 'choices.0.finishReason') ?? data_get($response, 'choices.0.finish_reason'),
@@ -206,6 +528,35 @@ class ChatController extends Controller
             'estimated_cost_usd' => $this->estimateGpt4oMiniCost($billableInputTokens, $cachedInputTokens, $outputTokens),
             'error' => $exception?->getMessage(),
         ]);
+    }
+
+    private function messagesForAudit(array $messages): array
+    {
+        return collect($messages)
+            ->map(fn (array $message): array => $this->sanitizeMessageForAudit($message))
+            ->all();
+    }
+
+    private function sanitizeMessageForAudit(array $message): array
+    {
+        if (! is_array($message['content'] ?? null)) {
+            return $message;
+        }
+
+        $message['content'] = collect($message['content'])
+            ->map(function (array $part): array {
+                if (($part['type'] ?? null) === 'file') {
+                    $part['file'] = [
+                        'filename' => $part['file']['filename'] ?? null,
+                        'file_data' => '[PDF omitted from audit log]',
+                    ];
+                }
+
+                return $part;
+            })
+            ->all();
+
+        return $message;
     }
 
     private function estimateGpt4oMiniCost(int $inputTokens, int $cachedInputTokens, int $outputTokens): float
